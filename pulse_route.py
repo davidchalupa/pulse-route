@@ -94,14 +94,16 @@ def interpolate_points(coord1, coord2, steps):
 # --- 2. Enhanced Demand Generation ---
 class DemandManager:
     DEMAND_LEVELS = {"low": 12, "medium": 30, "high": 60}
-    HOURLY_WEIGHTS = {8: 0.05, 9: 0.15, 10: 0.25, 11: 0.20, 12: 0.15, 13: 0.10, 14: 0.05, 15: 0.03, 16: 0.02}
+
+    # MODIFICATION: Sharp peak at 12:00 PM, tapering off realistically
+    HOURLY_WEIGHTS = {
+        8: 0.02, 9: 0.03, 10: 0.05, 11: 0.15,
+        12: 0.50,  # 50% of the daily demand happens in the noon hour
+        13: 0.15, 14: 0.05, 15: 0.03, 16: 0.02
+    }
 
     @classmethod
     def generate_realistic_demand(cls, city_polygon, start_time, level="medium", tightness=0.015):
-        """
-        Generates demand using a Gaussian distribution centered on the city center.
-        'tightness' controls the standard deviation (spread).
-        """
         num_orders = cls.DEMAND_LEVELS.get(level.lower(), 20)
         centroid = city_polygon.centroid
         center_lat, center_lon = centroid.y, centroid.x
@@ -110,13 +112,11 @@ class DemandManager:
         attempts = 0
 
         while len(orders) < num_orders and attempts < 1000:
-            # Gaussian spread: Draw points from a normal distribution around the center
             lat = random.gauss(center_lat, tightness)
             lon = random.gauss(center_lon, tightness)
 
             pnt = Point(lon, lat)
             if city_polygon.contains(pnt):
-                # Valid point found, now assign a time
                 hour = random.choices(list(cls.HOURLY_WEIGHTS.keys()),
                                       weights=list(cls.HOURLY_WEIGHTS.values()))[0]
                 minute = random.randint(0, 59)
@@ -154,12 +154,16 @@ class Order:
 
 
 class DeliverySimulation:
-    def __init__(self, depot_coords, orders, start_time, end_time, vehicle_speed_kmh=45):
+    # MODIFICATION: Added max_wait_minutes and vehicle_capacity
+    def __init__(self, depot_coords, orders, start_time, end_time, vehicle_speed_kmh=45, max_wait_minutes=30,
+                 vehicle_capacity=5):
         self.depot = depot_coords
         self.orders = orders
         self.start_time = start_time
         self.end_time = end_time
         self.vehicle_speed_mps = vehicle_speed_kmh * (1000 / 3600)
+        self.max_wait_minutes = max_wait_minutes
+        self.vehicle_capacity = vehicle_capacity
         self.trajectory = []
         self.total_distance = 0.0
 
@@ -169,7 +173,7 @@ class DeliverySimulation:
         travel_time_sec = dist / self.vehicle_speed_mps
         end_time = start_time + timedelta(seconds=travel_time_sec)
 
-        steps = max(1, int(travel_time_sec / 180))  # Interpolate every 3 mins for performance
+        steps = max(1, int(travel_time_sec / 180))
         interpolated = interpolate_points(start_loc, end_loc, steps)
 
         for i, p in enumerate(interpolated):
@@ -180,7 +184,7 @@ class DeliverySimulation:
 
     def run(self):
         print("\n" + "=" * 50)
-        print(f"🚀 RUNNING DYNAMIC SIMULATION")
+        print(f"🚀 RUNNING DYNAMIC BATCH SIMULATION")
         print("=" * 50)
 
         current_time = self.start_time
@@ -188,34 +192,70 @@ class DeliverySimulation:
         self.trajectory.append((current_time, current_loc))
         on_time, late = 0, 0
 
-        for order in self.orders:
-            if current_time < order.order_time:
-                current_time = order.order_time
+        # MODIFICATION: Process orders dynamically from a queue
+        unassigned_orders = sorted(self.orders, key=lambda o: o.order_time)
+
+        while unassigned_orders:
+            # Fast-forward time to next order if van is idle at depot
+            if current_time < unassigned_orders[0].order_time:
+                current_time = unassigned_orders[0].order_time
                 self.trajectory.append((current_time, current_loc))
 
-            if current_loc != self.depot:
-                current_time = self._travel(current_loc, self.depot, current_time)
-                current_loc = self.depot
+            # The anchor for our waiting window is the oldest unassigned order
+            batch_start_time = unassigned_orders[0].order_time
+            dispatch_time = batch_start_time + timedelta(minutes=self.max_wait_minutes)
 
-            current_time += timedelta(minutes=5)  # Loading time
-            self.trajectory.append((current_time, current_loc))
+            # Collect a batch of orders that fit inside our capacity and wait window
+            batch = []
+            for o in list(unassigned_orders):
+                if o.order_time <= dispatch_time and len(batch) < self.vehicle_capacity:
+                    batch.append(o)
+                elif len(batch) >= self.vehicle_capacity:
+                    break
 
-            current_time = self._travel(current_loc, order.coords, current_time)
-            current_loc = order.coords
-            order.delivered_at = current_time
+            # If our batch fills up *before* the max wait time, we can leave early
+            actual_dispatch_time = max(current_time, batch[-1].order_time)
+            if actual_dispatch_time > current_time:
+                current_time = actual_dispatch_time
+                self.trajectory.append((current_time, current_loc))
 
-            if order.delivered_at <= order.deadline:
-                on_time += 1
-                status = "🟢 ON TIME"
-            else:
-                late += 1
-                status = "🔴 LATE"
+            current_time += timedelta(minutes=5)  # Load the van with the whole batch
 
-            print(
-                f"[{current_time.strftime('%H:%M')}] Delivered {order.id} | Deadline: {order.deadline.strftime('%H:%M')} | {status}")
+            # Remove assigned items from the master queue
+            for o in batch:
+                unassigned_orders.remove(o)
 
+            # MODIFICATION: Nearest Neighbor Routing. Sort the batch to minimize zigzagging.
+            route_orders = []
+            temp_loc = self.depot
+            unrouted = list(batch)
+            while unrouted:
+                next_order = min(unrouted, key=lambda o: calculate_distance(temp_loc, o.coords))
+                route_orders.append(next_order)
+                temp_loc = next_order.coords
+                unrouted.remove(next_order)
+
+            # Execute the multi-stop route
+            for order in route_orders:
+                current_time = self._travel(current_loc, order.coords, current_time)
+                current_loc = order.coords
+                order.delivered_at = current_time
+
+                if order.delivered_at <= order.deadline:
+                    on_time += 1
+                    status = "🟢 ON TIME"
+                else:
+                    late += 1
+                    status = "🔴 LATE"
+
+                print(
+                    f"[{current_time.strftime('%H:%M')}] Delivered {order.id} | Deadline: {order.deadline.strftime('%H:%M')} | {status}")
+                current_time += timedelta(minutes=2)  # Dropoff/handover time
+
+            # Return to depot after completing the entire route
             current_time = self._travel(current_loc, self.depot, current_time)
             current_loc = self.depot
+            self.trajectory.append((current_time, current_loc))
 
         print("\n" + "-" * 50)
         print("🏁 SIMULATION COMPLETE.")
@@ -269,9 +309,15 @@ class DynamicVisualizer:
             }
         ]
 
+        # MODIFICATION: Sped up playback by adjusting transition_time and max_speed
         TimestampedGeoJson(
             {"type": "FeatureCollection", "features": features},
-            period="PT1M", transition_time=50, add_last_point=True, auto_play=True, loop=False, max_speed=1,
+            period="PT1M",
+            transition_time=10,  # Reduced from 50 to 10 for much faster frame transitions
+            add_last_point=True,
+            auto_play=True,
+            loop=False,
+            max_speed=15,        # Increased from 1 to 15 (allows fast-forwarding in UI)
             date_options='HH:mm'
         ).add_to(m)
 
@@ -281,24 +327,31 @@ class DynamicVisualizer:
 
 # --- 5. Execution ---
 if __name__ == "__main__":
-    # 1. Choose ANY city (Format: "City, Country" is safest)
     TARGET_CITY = "Vienna, Austria"
-    DEMAND_LEVEL = "low"  # Options: "low", "medium", "high"
+    DEMAND_LEVEL = "medium"
     TIGHTNESS = 0.03
 
     start_time = datetime(2026, 4, 5, 8, 0, 0)
     end_time = datetime(2026, 4, 5, 18, 0, 0)
 
-    # 2. Fetch the geofence
     depot_location, city_polygon = get_city_data(TARGET_CITY)
 
-    # 3. Generate demand strictly within the fence based on a realistic time curve
     orders = DemandManager.generate_realistic_demand(city_polygon, start_time, level=DEMAND_LEVEL, tightness=TIGHTNESS)
 
-    # 4. Run the simulation
-    sim = DeliverySimulation(depot_location, orders, start_time, end_time, vehicle_speed_kmh=45)
+    # MODIFICATION: Set how long the van can wait (max_wait_minutes) and how many packages it can hold (vehicle_capacity)
+    sim = DeliverySimulation(
+        depot_coords=depot_location,
+        orders=orders,
+        start_time=start_time,
+        end_time=end_time,
+        vehicle_speed_kmh=45,
+        # max_wait_minutes=0,  # No wait for order batching
+        # max_wait_minutes=15,  # Waits up to 15 mins to batch orders
+        max_wait_minutes=30,  # Waits up to 30 mins to batch orders
+        vehicle_capacity=6  # Takes up to 6 orders per route
+    )
+
     results = sim.run()
 
-    # 5. Visualize (Now includes the city boundary line)
     visualizer = DynamicVisualizer(depot_location)
     visualizer.generate_map(results, city_polygon)

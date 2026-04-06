@@ -9,54 +9,66 @@ import os
 from datetime import datetime, timedelta
 from shapely.geometry import shape, Point
 import matplotlib.pyplot as plt
+import osmnx as ox
+import networkx as nx
+import pickle
 
 
 # --- 1. Geospatial & Boundary Helpers ---
 def get_city_data(city_name):
-    """Fetches city boundary and center with better error handling."""
-    print(f"🌍 Querying OpenStreetMap for: {city_name}...")
+    """
+    Fetches city boundary, center, and road network with a local
+    (pickle-based) caching mechanism to avoid repeated heavy downloads.
+    """
+    # 1. Setup cache directory and filename
+    cache_dir = "city_cache"
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
 
-    # Use a unique User-Agent as required by Nominatim's Policy
-    headers = {
-        'User-Agent': 'PulseRouteSimulation_v2_Contact_YourName'
-    }
+    # Sanitize name for a valid filename (e.g., "vienna_austria.pkl")
+    safe_name = city_name.replace(",", "").replace(" ", "_").lower()
+    cache_path = os.path.join(cache_dir, f"{safe_name}.pkl")
 
-    # Ensure the city name is URL-encoded properly
-    params = {
-        'q': city_name,
-        'polygon_geojson': 1,
-        'format': 'json',
-        'limit': 1
-    }
+    # 2. Try to load from cache
+    if os.path.exists(cache_path):
+        print(f"📦 Loading cached road network for {city_name}...")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
 
+    # 3. Cache Miss: Fetch data normally
+    print(f"🌍 Cache miss. Querying OpenStreetMap for: {city_name}...")
+    headers = {'User-Agent': 'PulseRouteSimulation_v3_RoadAware'}
+    params = {'q': city_name, 'polygon_geojson': 1, 'format': 'json', 'limit': 1}
     url = "https://nominatim.openstreetmap.org/search"
 
     try:
         response = requests.get(url, headers=headers, params=params)
-
-        # Check if the server blocked us or had an error
         if response.status_code != 200:
-            print(f"❌ Server Error: {response.status_code}")
-            print(f"Response content: {response.text[:200]}")  # Show first 200 chars of error
             raise ConnectionError(f"Nominatim API returned status {response.status_code}")
 
         data = response.json()
-
         if not data:
-            raise ValueError(f"No results found for '{city_name}'. Check spelling or try 'City, Country'.")
+            raise ValueError(f"No results found for '{city_name}'.")
 
         city_info = data[0]
         center_coords = (float(city_info['lat']), float(city_info['lon']))
-
-        if 'geojson' not in city_info:
-            raise ValueError(f"The result for {city_name} did not contain boundary (polygon) data.")
-
         boundary_shape = shape(city_info['geojson'])
-        return center_coords, boundary_shape
 
-    except requests.exceptions.JSONDecodeError:
-        print("❌ Critical: The server returned HTML instead of JSON. You might be rate-limited.")
-        print(f"Server response starts with: {response.text[:100]}")
+        print(f"🛣️ Downloading road network for {city_name} (this will be cached)...")
+        # Download the drivable street network.
+        # NOTE: We keep the graph unprojected (Lat/Lon) so snapping works correctly.
+        graph = ox.graph_from_polygon(boundary_shape, network_type='drive')
+
+        # 4. Save to cache for next time
+        city_data = (center_coords, boundary_shape, graph)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(city_data, f)
+
+        print(f"💾 Data successfully cached at {cache_path}")
+        return city_data
+
+    except Exception as e:
+        print(f"❌ Error fetching city data: {e}")
         raise
 
 
@@ -73,6 +85,7 @@ def generate_points_in_polygon(polygon, num_points):
 
 
 def calculate_distance(coord1, coord2):
+    """Haversine distance (kept for legacy/demand logic)."""
     R = 6371000
     lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
     lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
@@ -80,15 +93,6 @@ def calculate_distance(coord1, coord2):
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
-
-
-def interpolate_points(coord1, coord2, steps):
-    points = []
-    dlat = (coord2[0] - coord1[0]) / steps
-    dlon = (coord2[1] - coord1[1]) / steps
-    for i in range(steps + 1):
-        points.append((coord1[0] + dlat * i, coord1[1] + dlon * i))
-    return points
 
 
 # --- 2. Enhanced Demand Generation ---
@@ -155,36 +159,63 @@ class Order:
 
 class DeliverySimulation:
     # MODIFICATION: Added max_wait_minutes and vehicle_capacity
-    def __init__(self, depot_coords, orders, start_time, end_time, vehicle_speed_kmh=45, max_wait_minutes=30,
+    def __init__(self, depot_coords, orders, start_time, end_time, graph, vehicle_speed_kmh=45, max_wait_minutes=30,
                  vehicle_capacity=5):
         self.depot = depot_coords
         self.orders = orders
         self.start_time = start_time
         self.end_time = end_time
+        self.graph = graph
         self.vehicle_speed_mps = vehicle_speed_kmh * (1000 / 3600)
         self.max_wait_minutes = max_wait_minutes
         self.vehicle_capacity = vehicle_capacity
         self.trajectory = []
         self.total_distance = 0.0
 
+    def _get_road_route(self, start_coords, end_coords):
+        """Finds the shortest path on the road network between two points."""
+        orig_node = ox.nearest_nodes(self.graph, start_coords[1], start_coords[0])
+        dest_node = ox.nearest_nodes(self.graph, end_coords[1], end_coords[0])
+
+        try:
+            route = nx.shortest_path(self.graph, orig_node, dest_node, weight='length')
+            path_coords = []
+            path_length = 0
+
+            nodes_data = self.graph.nodes
+            for i in range(len(route)):
+                node = route[i]
+                lat, lon = nodes_data[node]['y'], nodes_data[node]['x']
+                path_coords.append((lat, lon))
+
+                if i > 0:
+                    edge_data = self.graph.get_edge_data(route[i - 1], route[i])
+                    path_length += edge_data[0]['length']
+
+            return path_coords, path_length
+        except nx.NetworkXNoPath:
+            return [start_coords, end_coords], calculate_distance(start_coords, end_coords)
+
     def _travel(self, start_loc, end_loc, start_time):
-        dist = calculate_distance(start_loc, end_loc)
-        self.total_distance += dist
-        travel_time_sec = dist / self.vehicle_speed_mps
-        end_time = start_time + timedelta(seconds=travel_time_sec)
+        """Travels along the road network instead of a straight line."""
+        path_points, dist_meters = self._get_road_route(start_loc, end_loc)
+        self.total_distance += dist_meters
+        travel_time_sec = dist_meters / self.vehicle_speed_mps
 
-        steps = max(1, int(travel_time_sec / 180))
-        interpolated = interpolate_points(start_loc, end_loc, steps)
+        if not path_points or len(path_points) < 2:
+            return start_time, 0.0
 
-        for i, p in enumerate(interpolated):
-            t = start_time + timedelta(seconds=(travel_time_sec / steps) * i)
+        time_per_segment = travel_time_sec / (len(path_points) - 1)
+
+        for i, p in enumerate(path_points):
+            t = start_time + timedelta(seconds=time_per_segment * i)
             self.trajectory.append((t, p))
 
-        return end_time
+        return start_time + timedelta(seconds=travel_time_sec), dist_meters
 
     def run(self):
         print("\n" + "=" * 50)
-        print(f"🚀 RUNNING DYNAMIC BATCH SIMULATION")
+        print(f"🚀 RUNNING ROAD-AWARE BATCH SIMULATION")
         print("=" * 50)
 
         current_time = self.start_time
@@ -192,20 +223,16 @@ class DeliverySimulation:
         self.trajectory.append((current_time, current_loc))
         on_time, late = 0, 0
 
-        # MODIFICATION: Process orders dynamically from a queue
         unassigned_orders = sorted(self.orders, key=lambda o: o.order_time)
 
         while unassigned_orders:
-            # Fast-forward time to next order if van is idle at depot
             if current_time < unassigned_orders[0].order_time:
                 current_time = unassigned_orders[0].order_time
                 self.trajectory.append((current_time, current_loc))
 
-            # The anchor for our waiting window is the oldest unassigned order
             batch_start_time = unassigned_orders[0].order_time
             dispatch_time = batch_start_time + timedelta(minutes=self.max_wait_minutes)
 
-            # Collect a batch of orders that fit inside our capacity and wait window
             batch = []
             for o in list(unassigned_orders):
                 if o.order_time <= dispatch_time and len(batch) < self.vehicle_capacity:
@@ -213,19 +240,17 @@ class DeliverySimulation:
                 elif len(batch) >= self.vehicle_capacity:
                     break
 
-            # If our batch fills up *before* the max wait time, we can leave early
             actual_dispatch_time = max(current_time, batch[-1].order_time)
             if actual_dispatch_time > current_time:
                 current_time = actual_dispatch_time
                 self.trajectory.append((current_time, current_loc))
 
-            current_time += timedelta(minutes=5)  # Load the van with the whole batch
+            current_time += timedelta(minutes=5)  # Loading time
 
-            # Remove assigned items from the master queue
             for o in batch:
                 unassigned_orders.remove(o)
 
-            # MODIFICATION: Nearest Neighbor Routing. Sort the batch to minimize zigzagging.
+            # Nearest Neighbor Routing
             route_orders = []
             temp_loc = self.depot
             unrouted = list(batch)
@@ -235,25 +260,33 @@ class DeliverySimulation:
                 temp_loc = next_order.coords
                 unrouted.remove(next_order)
 
+            # Leg tracking for verbose logging
+            last_loc_name = "Depot"
+
             # Execute the multi-stop route
             for order in route_orders:
-                current_time = self._travel(current_loc, order.coords, current_time)
+                departure_time = current_time
+                current_time, leg_dist = self._travel(current_loc, order.coords, current_time)
                 current_loc = order.coords
                 order.delivered_at = current_time
 
+                status = "🟢 ON TIME" if order.delivered_at <= order.deadline else "🔴 LATE"
                 if order.delivered_at <= order.deadline:
                     on_time += 1
-                    status = "🟢 ON TIME"
                 else:
                     late += 1
-                    status = "🔴 LATE"
 
-                print(
-                    f"[{current_time.strftime('%H:%M')}] Delivered {order.id} | Deadline: {order.deadline.strftime('%H:%M')} | {status}")
-                current_time += timedelta(minutes=2)  # Dropoff/handover time
+                # ENHANCED LOGGING
+                print(f"[{current_time.strftime('%H:%M')}] Delivered {order.id} | "
+                      f"From: {last_loc_name} (Left {departure_time.strftime('%H:%M')}) | "
+                      f"Leg: {leg_dist / 1000:.2f} km | "
+                      f"Deadline: {order.deadline.strftime('%H:%M')} | {status}")
 
-            # Return to depot after completing the entire route
-            current_time = self._travel(current_loc, self.depot, current_time)
+                last_loc_name = order.id
+                current_time += timedelta(minutes=2)  # Dropoff time
+
+            # Return to depot
+            current_time, _ = self._travel(current_loc, self.depot, current_time)
             current_loc = self.depot
             self.trajectory.append((current_time, current_loc))
 
@@ -271,13 +304,12 @@ class DynamicVisualizer:
     def __init__(self, depot_coords):
         self.depot_coords = depot_coords
 
-    def generate_map(self, simulation_results, boundary_polygon, filename="global_route_map.html"):
-        m = folium.Map(location=self.depot_coords, zoom_start=12, tiles="cartodbpositron")
+    def generate_map(self, simulation_results, boundary_polygon, filename="road_aware_map.html"):
+        m = folium.Map(location=self.depot_coords, zoom_start=13, tiles="cartodbpositron")
 
-        # Draw the City Boundary to prove the geofencing worked
         folium.GeoJson(
             boundary_polygon,
-            style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.1, 'weight': 2}
+            style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05, 'weight': 1}
         ).add_to(m)
 
         folium.Marker(self.depot_coords, popup="Depot", icon=folium.Icon(color='black', icon='home')).add_to(m)
@@ -285,9 +317,9 @@ class DynamicVisualizer:
         for order in simulation_results["orders"]:
             color = "green" if order.delivered_at <= order.deadline else "red"
             folium.CircleMarker(
-                location=order.coords, radius=6,
+                location=order.coords, radius=5,
                 popup=f"<b>{order.id}</b><br>Ordered: {order.order_time.strftime('%H:%M')}<br>Delivered: {order.delivered_at.strftime('%H:%M')}",
-                color=color, fill=True, fill_opacity=0.8
+                color=color, fill=True, fill_opacity=0.7
             ).add_to(m)
 
         coordinates, times = [], []
@@ -299,25 +331,24 @@ class DynamicVisualizer:
             {
                 "type": "Feature",
                 "geometry": {"type": "LineString", "coordinates": coordinates},
-                "properties": {"times": times, "style": {"color": "#3388ff", "weight": 3, "opacity": 0.5}}
+                "properties": {"times": times, "style": {"color": "#3498db", "weight": 4, "opacity": 0.6}}
             },
             {
                 "type": "Feature",
-                "geometry": {"type": "MultiPoint", "coordinates": coordinates},
+                "geometry": {"type": "Point", "coordinates": coordinates[0]},
                 "properties": {"times": times, "icon": "circle",
-                               "iconstyle": {"fillColor": "blue", "fillOpacity": 1, "stroke": "true", "radius": 7}}
+                               "iconstyle": {"fillColor": "#2980b9", "fillOpacity": 1, "stroke": "true", "radius": 6}}
             }
         ]
 
-        # MODIFICATION: Sped up playback by adjusting transition_time and max_speed
         TimestampedGeoJson(
             {"type": "FeatureCollection", "features": features},
             period="PT1M",
-            transition_time=10,  # Reduced from 50 to 10 for much faster frame transitions
+            transition_time=15,
             add_last_point=True,
             auto_play=True,
             loop=False,
-            max_speed=15,        # Increased from 1 to 15 (allows fast-forwarding in UI)
+            max_speed=20,
             date_options='HH:mm'
         ).add_to(m)
 
@@ -329,26 +360,25 @@ class DynamicVisualizer:
 if __name__ == "__main__":
     TARGET_CITY = "Vienna, Austria"
     DEMAND_LEVEL = "medium"
-    TIGHTNESS = 0.03
+    TIGHTNESS = 0.02
 
     start_time = datetime(2026, 4, 5, 8, 0, 0)
     end_time = datetime(2026, 4, 5, 18, 0, 0)
 
-    depot_location, city_polygon = get_city_data(TARGET_CITY)
+    depot_location, city_polygon, road_graph = get_city_data(TARGET_CITY)
 
     orders = DemandManager.generate_realistic_demand(city_polygon, start_time, level=DEMAND_LEVEL, tightness=TIGHTNESS)
 
-    # MODIFICATION: Set how long the van can wait (max_wait_minutes) and how many packages it can hold (vehicle_capacity)
     sim = DeliverySimulation(
         depot_coords=depot_location,
         orders=orders,
         start_time=start_time,
         end_time=end_time,
-        vehicle_speed_kmh=45,
-        # max_wait_minutes=0,  # No wait for order batching
-        # max_wait_minutes=15,  # Waits up to 15 mins to batch orders
-        max_wait_minutes=30,  # Waits up to 30 mins to batch orders
-        vehicle_capacity=6  # Takes up to 6 orders per route
+        graph=road_graph,
+        vehicle_speed_kmh=40,
+        # max_wait_minutes=0,     # Simulation with no wait allowed
+        max_wait_minutes=25,    # Simulation with potential 25 minute waiting
+        vehicle_capacity=5
     )
 
     results = sim.run()

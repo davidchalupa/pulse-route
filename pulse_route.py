@@ -1,4 +1,3 @@
-import math
 import random
 import requests
 import folium
@@ -12,6 +11,8 @@ import networkx as nx
 import pickle
 import streamlit as st
 import streamlit.components.v1 as components
+
+import routing_engine_nn
 
 # --- App Configuration & Styling ---
 st.set_page_config(page_title="PulseRoute Simulator", page_icon="🚚", layout="wide")
@@ -52,16 +53,6 @@ def get_city_data(city_name):
         pickle.dump(city_data, f)
 
     return city_data
-
-
-def calculate_distance(coord1, coord2):
-    R = 6371000
-    lat1, lon1 = math.radians(coord1[0]), math.radians(coord1[1])
-    lat2, lon2 = math.radians(coord2[0]), math.radians(coord2[1])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
 
 
 # --- 2. Enhanced Demand Generation ---
@@ -105,13 +96,14 @@ class DemandManager:
 # --- 3. Multi-Vehicle Simulation Logic ---
 class DeliverySimulation:
     def __init__(self, depot_coords, orders, graph, num_vehicles=1, vehicle_speed_kmh=45,
-                 max_wait_minutes=30, vehicle_capacity=5):
+                 max_wait_minutes=30, vehicle_capacity=5, route_algorithm=routing_engine_nn.base_route_sequencer):
         self.depot = depot_coords
         self.orders = orders
         self.graph = graph
         self.vehicle_speed_mps = vehicle_speed_kmh * (1000 / 3600)
         self.max_wait_minutes = max_wait_minutes
         self.vehicle_capacity = vehicle_capacity
+        self.route_algorithm = route_algorithm  # Retain the modular algorithm strategy block
 
         # Initialize fleet
         self.vehicles = [{"id": i, "loc": depot_coords, "time": orders[0].order_time if orders else datetime.now(),
@@ -132,7 +124,7 @@ class DeliverySimulation:
                     path_length += self.graph.get_edge_data(route[i - 1], route[i])[0]['length']
             return path_coords, path_length
         except nx.NetworkXNoPath:
-            return [start_coords, end_coords], calculate_distance(start_coords, end_coords)
+            return [start_coords, end_coords], routing_engine_nn.calculate_haversine_distance(start_coords, end_coords)
 
     def _travel(self, vehicle, end_loc):
         path_points, dist_meters = self._get_road_route(vehicle["loc"], end_loc)
@@ -174,15 +166,8 @@ class DeliverySimulation:
             for o in batch:
                 unassigned_orders.remove(o)
 
-            # Nearest Neighbor Routing
-            route_orders = []
-            temp_loc = v["loc"]
-            unrouted = list(batch)
-            while unrouted:
-                next_order = min(unrouted, key=lambda o: calculate_distance(temp_loc, o.coords))
-                route_orders.append(next_order)
-                temp_loc = next_order.coords
-                unrouted.remove(next_order)
+            # calling the chosen routing algorithm for the simulation engine
+            route_orders = self.route_algorithm(v["loc"], batch)
 
             # Execute route
             for order in route_orders:
@@ -202,13 +187,11 @@ class DeliverySimulation:
 
 # --- 4. Stepper Logic & UI ---
 
-# Initialize Step in Session State
 if 'current_step' not in st.session_state:
     st.session_state.current_step = 0
 
 step_names = ["📍 Location", "📊 Demand", "⚙️ Fleet", "🏁 Simulate"]
 
-# Progress Bar & Headers
 st.progress((st.session_state.current_step + 1) / len(step_names))
 cols = st.columns(len(step_names))
 for i, name in enumerate(step_names):
@@ -309,9 +292,9 @@ elif st.session_state.current_step == 3:
             params = st.session_state['sim_params']
 
             with st.spinner(f"Simulating routing for {params['num_vehicles']} vehicle(s)..."):
-                # Reset order delivery status in case of re-runs
                 for o in orders: o.delivered_at = None
 
+                # Creates simulation injecting default interface module strategy
                 sim = DeliverySimulation(depot_loc, orders, graph, **params)
                 results = sim.run()
 
@@ -330,7 +313,6 @@ elif st.session_state.current_step == 3:
                 folium.GeoJson(boundary, style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05}).add_to(m)
                 folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home')).add_to(m)
 
-                # Colors for different vehicles
                 colors = ['#3498db', '#e74c3c', '#9b59b6', '#f1c40f', '#e67e22', '#2ecc71']
                 features = []
 
@@ -342,13 +324,11 @@ elif st.session_state.current_step == 3:
 
                     if coords:
                         color = colors[v["id"] % len(colors)]
-                        # Trajectory Line
                         features.append({
                             "type": "Feature",
                             "geometry": {"type": "LineString", "coordinates": coords},
                             "properties": {"times": times, "style": {"color": color, "weight": 4, "opacity": 0.7}}
                         })
-                        # Moving Vehicle Point
                         features.append({
                             "type": "Feature",
                             "geometry": {"type": "Point", "coordinates": coords[0]},
@@ -386,7 +366,6 @@ if st.session_state.current_step > 0:
         st.rerun()
 
 if st.session_state.current_step < len(step_names) - 1:
-    # Disable "Next" if critical data is missing
     disabled = False
     if st.session_state.current_step == 0 and 'city_data' not in st.session_state: disabled = True
     if st.session_state.current_step == 1 and 'orders' not in st.session_state: disabled = True

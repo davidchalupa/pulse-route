@@ -13,6 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import routing_engine_nn
+import routing_engine_ls_2opt
 
 # --- App Configuration & Styling ---
 st.set_page_config(page_title="PulseRoute Simulator", page_icon="🚚", layout="wide")
@@ -103,7 +104,7 @@ class DeliverySimulation:
         self.vehicle_speed_mps = vehicle_speed_kmh * (1000 / 3600)
         self.max_wait_minutes = max_wait_minutes
         self.vehicle_capacity = vehicle_capacity
-        self.route_algorithm = route_algorithm  # Retain the modular algorithm strategy block
+        self.route_algorithm = route_algorithm
 
         # Initialize fleet
         self.vehicles = [{"id": i, "loc": depot_coords, "time": orders[0].order_time if orders else datetime.now(),
@@ -166,8 +167,11 @@ class DeliverySimulation:
             for o in batch:
                 unassigned_orders.remove(o)
 
-            # calling the chosen routing algorithm for the simulation engine
-            route_orders = self.route_algorithm(v["loc"], batch)
+            # Safely attempt to inject identifying route context into matching log engine signatures
+            try:
+                route_orders = self.route_algorithm(v["loc"], batch, route_id=f"Vehicle_{v['id']}_Batch")
+            except TypeError:
+                route_orders = self.route_algorithm(v["loc"], batch)
 
             # Execute route
             for order in route_orders:
@@ -273,11 +277,26 @@ elif st.session_state.current_step == 2:
         wait = c2.slider("Max Wait (mins)", 0, 60, 25, help="How long a package waits at the depot to build a batch.")
         spd = c2.slider("Speed (km/h)", 20, 80, 45)
 
+        # Dropdown selection for the dispatch engine algorithm strategy
+        selected_engine_name = c1.selectbox(
+            "Routing Optimization Engine",
+            options=["Nearest Neighbor Heuristic (Fast Baseline)", "2-Opt Local Search (Path Untangling)"],
+            index=0,
+            help="Nearest Neighbor processes stops linearly by proximity. 2-Opt Local Search runs an enhancement loop to reduce route backtracking."
+        )
+
+        # Mapping engine text selections back to code dependencies
+        if selected_engine_name == "Nearest Neighbor Heuristic (Fast Baseline)":
+            chosen_algorithm = routing_engine_nn.base_route_sequencer
+        else:
+            chosen_algorithm = routing_engine_ls_2opt.base_route_sequencer
+
         st.session_state['sim_params'] = {
             "num_vehicles": num_v, "vehicle_capacity": cap,
-            "max_wait_minutes": wait, "vehicle_speed_kmh": spd
+            "max_wait_minutes": wait, "vehicle_speed_kmh": spd,
+            "route_algorithm": chosen_algorithm,
         }
-        st.success("Configuration saved! You are ready to run the simulation.")
+        st.success(f"Configuration saved using backend engine: {selected_engine_name}!")
 
 
 # --- STEP 4: SIMULATE ---
@@ -294,7 +313,7 @@ elif st.session_state.current_step == 3:
             with st.spinner(f"Simulating routing for {params['num_vehicles']} vehicle(s)..."):
                 for o in orders: o.delivered_at = None
 
-                # Creates simulation injecting default interface module strategy
+                # Creates simulation injecting selected interface module strategy
                 sim = DeliverySimulation(depot_loc, orders, graph, **params)
                 results = sim.run()
 

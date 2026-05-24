@@ -1,6 +1,7 @@
 """
 PulseRoute Logistics Engine - Algorithmic Core
-Exposes plug-and-play routing and sequencing algorithms.
+
+Baseline nearest-neighbor sequencing algorithm
 """
 
 import math

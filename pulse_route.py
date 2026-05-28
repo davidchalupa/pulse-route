@@ -12,8 +12,10 @@ import pickle
 import streamlit as st
 import streamlit.components.v1 as components
 
+# Import original and new routing engines
 import routing_engine_nn
 import routing_engine_ls_2opt
+import routing_engine_cvrp  # Core Engine for Global Optimization
 
 # --- App Configuration & Styling ---
 st.set_page_config(page_title="PulseRoute Simulator", page_icon="🚚", layout="wide")
@@ -97,14 +99,18 @@ class DemandManager:
 # --- 3. Multi-Vehicle Simulation Logic ---
 class DeliverySimulation:
     def __init__(self, depot_coords, orders, graph, num_vehicles=1, vehicle_speed_kmh=45,
-                 max_wait_minutes=30, vehicle_capacity=5, route_algorithm=routing_engine_nn.base_route_sequencer):
+                 max_wait_minutes=30, vehicle_capacity=5, route_algorithm=None,
+                 optimization_scope="Local", sla_mode="hard"):
         self.depot = depot_coords
         self.orders = orders
         self.graph = graph
+        self.vehicle_speed_kmh = vehicle_speed_kmh
         self.vehicle_speed_mps = vehicle_speed_kmh * (1000 / 3600)
         self.max_wait_minutes = max_wait_minutes
         self.vehicle_capacity = vehicle_capacity
         self.route_algorithm = route_algorithm
+        self.optimization_scope = optimization_scope
+        self.sla_mode = sla_mode
 
         # Initialize fleet
         self.vehicles = [{"id": i, "loc": depot_coords, "time": orders[0].order_time if orders else datetime.now(),
@@ -125,7 +131,7 @@ class DeliverySimulation:
                     path_length += self.graph.get_edge_data(route[i - 1], route[i])[0]['length']
             return path_coords, path_length
         except nx.NetworkXNoPath:
-            return [start_coords, end_coords], routing_engine_nn.calculate_haversine_distance(start_coords, end_coords)
+            return [start_coords, end_coords], routing_engine_cvrp.calculate_haversine_distance(start_coords, end_coords)
 
     def _travel(self, vehicle, end_loc):
         path_points, dist_meters = self._get_road_route(vehicle["loc"], end_loc)
@@ -142,54 +148,105 @@ class DeliverySimulation:
         vehicle["loc"] = end_loc
 
     def run(self):
-        unassigned_orders = sorted(self.orders, key=lambda o: o.order_time)
         on_time = 0
 
-        while unassigned_orders:
-            # Pick the earliest available vehicle
-            v = min(self.vehicles, key=lambda x: x["time"])
+        # ==========================================================
+        # STRATEGY A: GLOBAL CVRP OPTIMIZATION (Trip-Aware Deployment)
+        # ==========================================================
+        if "Global" in self.optimization_scope:
+            # Let the CVRP engine figure out fleet assignment and sequence upfront using trips
+            global_trips = routing_engine_cvrp.global_cvrp_solver(
+                self.depot, self.orders, len(self.vehicles), self.vehicle_capacity,
+                self.vehicle_speed_kmh, sla_mode=self.sla_mode
+            )
 
-            if v["time"] < unassigned_orders[0].order_time:
-                v["time"] = unassigned_orders[0].order_time
-                v["trajectory"].append((v["time"], v["loc"]))
+            for v in self.vehicles:
+                assigned_trips = global_trips.get(v["id"], [])
+                if not assigned_trips:
+                    continue
 
-            dispatch_time = unassigned_orders[0].order_time + timedelta(minutes=self.max_wait_minutes)
+                # Align vehicle starting clock safely to its first assigned trip
+                if v["time"] < assigned_trips[0][0].order_time:
+                    v["time"] = assigned_trips[0][0].order_time
 
-            batch = []
-            for o in list(unassigned_orders):
-                if o.order_time <= dispatch_time and len(batch) < self.vehicle_capacity:
-                    batch.append(o)
-                elif len(batch) >= self.vehicle_capacity:
-                    break
+                for trip in assigned_trips:
+                    if not trip:
+                        continue
 
-            v["time"] = max(v["time"], batch[-1].order_time) + timedelta(minutes=5)  # Load time
+                    # Log departure from depot
+                    v["trajectory"].append((v["time"], v["loc"]))
+                    v["time"] += timedelta(minutes=5)  # Loading time at depot for this trip
 
-            for o in batch:
-                unassigned_orders.remove(o)
+                    # Deliver the optimized sequence within this discrete trip
+                    for order in trip:
+                        # Safety fallback: vehicle clock cannot deliver an order before it is placed
+                        if v["time"] < order.order_time:
+                            v["time"] = order.order_time
+                            v["trajectory"].append((v["time"], v["loc"]))
 
-            # Safely attempt to inject identifying route context into matching log engine signatures
-            try:
-                route_orders = self.route_algorithm(v["loc"], batch, route_id=f"Vehicle_{v['id']}_Batch")
-            except TypeError:
-                route_orders = self.route_algorithm(v["loc"], batch)
+                        self._travel(v, order.coords)
+                        order.delivered_at = v["time"]
+                        order.assigned_vehicle = v["id"]
+                        if order.delivered_at <= order.deadline:
+                            on_time += 1
+                        v["time"] += timedelta(minutes=2)  # Dropoff time
 
-            # Execute route
-            for order in route_orders:
-                self._travel(v, order.coords)
-                order.delivered_at = v["time"]
-                order.assigned_vehicle = v["id"]
-                if order.delivered_at <= order.deadline:
-                    on_time += 1
-                v["time"] += timedelta(minutes=2)  # Dropoff time
+                    # Return home to depot to conclude this trip and prepare for next capacity cycle
+                    self._travel(v, self.depot)
 
-            # Return to depot
-            self._travel(v, self.depot)
+        # ==========================================================
+        # STRATEGY B: LOCAL FIXED BATCHES (Original Sequential Constraint)
+        # ==========================================================
+        else:
+            unassigned_orders = sorted(self.orders, key=lambda o: o.order_time)
+
+            while unassigned_orders:
+                # Pick the earliest available vehicle
+                v = min(self.vehicles, key=lambda x: x["time"])
+
+                if v["time"] < unassigned_orders[0].order_time:
+                    v["time"] = unassigned_orders[0].order_time
+                    v["trajectory"].append((v["time"], v["loc"]))
+
+                dispatch_time = unassigned_orders[0].order_time + timedelta(minutes=self.max_wait_minutes)
+
+                batch = []
+                for o in list(unassigned_orders):
+                    if o.order_time <= dispatch_time and len(batch) < self.vehicle_capacity:
+                        batch.append(o)
+                    elif len(batch) >= self.vehicle_capacity:
+                        break
+
+                v["time"] = max(v["time"], batch[-1].order_time) + timedelta(minutes=5)  # Load time
+
+                for o in batch:
+                    unassigned_orders.remove(o)
+
+                # Execute route sequence optimization via selected local strategy wrapper
+                try:
+                    route_orders = self.route_algorithm(v["loc"], batch, route_id=f"Vehicle_{v['id']}_Batch")
+                except TypeError:
+                    route_orders = self.route_algorithm(v["loc"], batch)
+
+                # Execute route travel simulation
+                for order in route_orders:
+                    if v["time"] < order.order_time:
+                        v["time"] = order.order_time
+                    self._travel(v, order.coords)
+                    order.delivered_at = v["time"]
+                    order.assigned_vehicle = v["id"]
+                    if order.delivered_at <= order.deadline:
+                        on_time += 1
+                    v["time"] += timedelta(minutes=2)  # Dropoff time
+
+                # Return to depot
+                self._travel(v, self.depot)
 
         total_distance = sum(v["distance"] for v in self.vehicles)
         return {"orders": self.orders, "vehicles": self.vehicles, "on_time": on_time, "total_distance": total_distance}
 
 
-# --- 4. Stepper Logic & UI ---
+# --- 4. Stepper Logic & UI Pipeline ---
 
 if 'current_step' not in st.session_state:
     st.session_state.current_step = 0
@@ -265,38 +322,57 @@ elif st.session_state.current_step == 1:
             st.success(f"Generated {num_orders} orders successfully!")
 
 
-# --- STEP 3: FLEET ---
+# --- STEP 3: FLEET & STRATEGY SELECTION ---
 elif st.session_state.current_step == 2:
-    st.header("Fleet Configuration")
+    st.header("Fleet & Optimization Strategy Configuration")
     if 'orders' not in st.session_state:
         st.warning("Please generate demand first.")
     else:
         c1, c2 = st.columns(2)
         num_v = c1.number_input("Vehicles", min_value=1, max_value=10, value=2)
         cap = c1.number_input("Capacity", min_value=1, max_value=20, value=5)
-        wait = c2.slider("Max Wait (mins)", 0, 60, 25, help="How long a package waits at the depot to build a batch.")
+        wait = c2.slider("Max Wait (mins)", 0, 60, 25,
+                         help="How long a package waits at the depot to build a batch (Only applies to Local Strategy).")
         spd = c2.slider("Speed (km/h)", 20, 80, 45)
 
-        # Dropdown selection for the dispatch engine algorithm strategy
-        selected_engine_name = c1.selectbox(
-            "Routing Optimization Engine",
-            options=["Nearest Neighbor Heuristic (Fast Baseline)", "2-Opt Local Search (Path Untangling)"],
-            index=0,
-            help="Nearest Neighbor processes stops linearly by proximity. 2-Opt Local Search runs an enhancement loop to reduce route backtracking."
+        st.markdown("### 🎛️ Optimization Scope Selection")
+        opt_scope = st.radio(
+            "Select System Optimization Strategy:",
+            ["Local (Fixed Sequential Batches)", "Global (Dynamic Fleet Assignment)"],
+            help="Local Strategy locks orders chronologically into fixed batches before sequencing. Global Strategy dissolves batch borders, assigning orders dynamically across the entire fleet to achieve minimized global travel penalties."
         )
 
-        # Mapping engine text selections back to code dependencies
-        if selected_engine_name == "Nearest Neighbor Heuristic (Fast Baseline)":
-            chosen_algorithm = routing_engine_nn.base_route_sequencer
+        chosen_algorithm = routing_engine_ls_2opt.base_route_sequencer
+        engine_name_notice = "2-Opt Local Search Sequencer"
+        sla_constraint_type = "hard"
+
+        if opt_scope == "Local (Fixed Sequential Batches)":
+            selected_engine_name = c1.selectbox(
+                "Local Routing Sequence Variant",
+                options=["Nearest Neighbor Heuristic (Fast Baseline)", "2-Opt Local Search (Path Untangling)"],
+                index=1
+            )
+            if "Nearest Neighbor" in selected_engine_name:
+                chosen_algorithm = routing_engine_nn.base_route_sequencer
+                engine_name_notice = "Nearest Neighbor Sequencer"
         else:
-            chosen_algorithm = routing_engine_ls_2opt.base_route_sequencer
+            sla_constraint_type = st.radio(
+                "Global SLA Rule Enforcement:",
+                options=["hard", "dynamic"],
+                format_func=lambda x: "Strict Constraint (Forces 100% SLA)" if x == "hard" else "Dynamic Balancing (Prioritizes Mileage Reduction)",
+                help="Hard Constraints enforce an absolute ban on deliveries that exceed their deadline. Dynamic allows marginal tardiness if it saves massive travel distance."
+            )
 
         st.session_state['sim_params'] = {
-            "num_vehicles": num_v, "vehicle_capacity": cap,
-            "max_wait_minutes": wait, "vehicle_speed_kmh": spd,
+            "num_vehicles": num_v,
+            "vehicle_capacity": cap,
+            "max_wait_minutes": wait,
+            "vehicle_speed_kmh": spd,
             "route_algorithm": chosen_algorithm,
+            "optimization_scope": opt_scope,
+            "sla_mode": sla_constraint_type
         }
-        st.success(f"Configuration saved using backend engine: {selected_engine_name}!")
+        st.success(f"Configuration locked using strategy: {opt_scope}!")
 
 
 # --- STEP 4: SIMULATE ---
@@ -310,27 +386,28 @@ elif st.session_state.current_step == 3:
             orders = st.session_state['orders']
             params = st.session_state['sim_params']
 
-            with st.spinner(f"Simulating routing for {params['num_vehicles']} vehicle(s)..."):
-                for o in orders: o.delivered_at = None
+            with st.spinner(f"Simulating routing via {params['optimization_scope']}..."):
+                for o in orders:
+                    o.delivered_at = None
 
-                # Creates simulation injecting selected interface module strategy
+                # Creates simulation and injects configuration params
                 sim = DeliverySimulation(depot_loc, orders, graph, **params)
                 results = sim.run()
 
-                # --- Metrics ---
-                st.subheader("Simulation Results")
+                # --- Metrics Display ---
+                st.subheader("Simulation Performance Analysis")
                 c1, c2, c3 = st.columns(3)
                 success_rate = (results['on_time'] / len(orders)) * 100
                 c1.metric("SLA Success Rate", f"{success_rate:.1f}%",
                           f"{results['on_time']}/{len(orders)} On Time",
                           delta_color="normal" if success_rate > 90 else "inverse")
                 c2.metric("Total Distance Driven", f"{results['total_distance'] / 1000:.2f} km")
-                c3.metric("Fleet Used", f"{params['num_vehicles']} Vehicles")
+                c3.metric("Active Fleet Strength", f"{params['num_vehicles']} Vehicles Used")
 
-                # --- Map Generation ---
+                # --- Leaflet Map Reconstruction Pipeline ---
                 m = folium.Map(location=depot_loc, zoom_start=13, tiles="cartodbpositron")
                 folium.GeoJson(boundary, style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05}).add_to(m)
-                folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home')).add_to(m)
+                folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home'), popup="Central Depot").add_to(m)
 
                 colors = ['#3498db', '#e74c3c', '#9b59b6', '#f1c40f', '#e67e22', '#2ecc71']
                 features = []
@@ -356,11 +433,13 @@ elif st.session_state.current_step == 3:
                                                          "radius": 7}}
                         })
 
+                # Plot order drops matching original custom formatting structure
                 for o in results["orders"]:
-                    m_color = "green" if o.delivered_at <= o.deadline else "red"
+                    m_color = "green" if o.delivered_at and o.delivered_at <= o.deadline else "red"
+                    deliv_time = o.delivered_at.strftime('%H:%M') if o.delivered_at else "Unfulfilled"
                     folium.CircleMarker(
                         location=o.coords, radius=5, color=m_color, fill=True, fill_opacity=0.7,
-                        popup=f"Order {o.id}<br>Delivered: {o.delivered_at.strftime('%H:%M')}"
+                        popup=f"<b>Order:</b> {o.id}<br><b>Placed:</b> {o.order_time.strftime('%H:%M')}<br><b>Delivered:</b> {deliv_time}<br><b>Vehicle:</b> Truck_{o.assigned_vehicle}"
                     ).add_to(m)
 
                 TimestampedGeoJson(
@@ -371,11 +450,11 @@ elif st.session_state.current_step == 3:
                 html_path = "sim_result.html"
                 m.save(html_path)
 
-                st.markdown("### 🗺️ GPS Replay")
+                st.markdown("### 🗺️ Dynamic GPS Replay Context")
                 with open(html_path, 'r', encoding='utf-8') as f:
                     components.html(f.read(), height=650)
 
-# --- NAVIGATION BUTTONS ---
+# --- NAVIGATION PIPELINE BUTTONS ---
 st.divider()
 nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 4])
 

@@ -62,6 +62,7 @@ def local_search_2opt_time_aware(start_location, orders_batch, speed_mps):
 
     return current_route
 
+
 def global_cvrp_solver(depot_coords, orders, num_vehicles, vehicle_capacity, speed_kmh, sla_mode="hard"):
     """
     Builds discrete 'Trips' (Depot -> Deliveries -> Depot) ensuring vehicles
@@ -71,18 +72,17 @@ def global_cvrp_solver(depot_coords, orders, num_vehicles, vehicle_capacity, spe
                      "dynamic" to use soft cost-penalties.
     """
     speed_mps = speed_kmh * (1000 / 3600)
-    unassigned = sorted(orders, key=lambda o: o.order_time)
 
-    # v_clocks tracks when each vehicle is back at the depot ready for its next trip
+    # Sort primarily by deadline urgency, then by order time.
+    unassigned = sorted(orders, key=lambda o: (o.deadline, o.order_time))
+
     v_clocks = {i: unassigned[0].order_time for i in range(num_vehicles)}
     v_trips = {i: [] for i in range(num_vehicles)}
 
     while unassigned:
-        # Find the earliest available vehicle
         v_id = min(range(num_vehicles), key=lambda idx: v_clocks[idx])
         current_clock = v_clocks[v_id]
 
-        # 1. Seed the trip with the most urgent/chronologically appropriate order
         best_seed = None
         best_seed_score = float('inf')
 
@@ -91,31 +91,33 @@ def global_cvrp_solver(depot_coords, orders, num_vehicles, vehicle_capacity, spe
             travel_time = timedelta(seconds=dist_to_o / speed_mps)
             arrival = max(current_clock + travel_time, o.order_time)
 
-            # If utilizing hard constraints, make sure the seed itself isn't fundamentally late
             if sla_mode == "hard" and arrival > o.deadline:
                 continue
 
             wait_time = max(0, (o.order_time - (current_clock + travel_time)).total_seconds())
+            time_left = max(0, (o.deadline - arrival).total_seconds())
 
-            # Score heavily penalizes orders that force trucks to sit idle for > 1 hour
-            score = wait_time * 2 + dist_to_o
+            # Incorporate time_left. Urgent orders (smaller time_left) score better.
+            # 0.5 is a scaling factor to balance seconds with meters.
+            score = dist_to_o + (wait_time * 2) + (time_left * 0.5)
 
             if score < best_seed_score:
                 best_seed_score = score
                 best_seed = o
 
-        # Fallback: if hard constraint left us with no viable seeds, relax rule to flush remaining queue
         if best_seed is None and unassigned:
-            best_seed = min(unassigned, key=lambda o: calculate_haversine_distance(depot_coords, o.coords))
+            # Fallback still triggers if no valid routes exist, but prioritize urgency here too
+            best_seed = min(unassigned, key=lambda o: calculate_haversine_distance(depot_coords, o.coords) + (
+                        o.deadline - current_clock).total_seconds())
 
         trip = [best_seed]
         unassigned.remove(best_seed)
 
         current_loc = best_seed.coords
         dist_to_seed = calculate_haversine_distance(depot_coords, best_seed.coords)
-        trip_clock = max(current_clock + timedelta(seconds=dist_to_seed/speed_mps), best_seed.order_time) + timedelta(minutes=2)
+        trip_clock = max(current_clock + timedelta(seconds=dist_to_seed / speed_mps), best_seed.order_time) + timedelta(
+            minutes=2)
 
-        # 2. Greedily fill the trip up to vehicle capacity with nearby orders
         while len(trip) < vehicle_capacity and unassigned:
             best_next = None
             best_next_score = float('inf')
@@ -126,18 +128,18 @@ def global_cvrp_solver(depot_coords, orders, num_vehicles, vehicle_capacity, spe
                 arr = max(trip_clock + travel, o.order_time)
                 wait = max(0, (o.order_time - (trip_clock + travel)).total_seconds())
 
-                # Only bundle orders if wait time is < 45 mins to prevent schedule drifting
                 if wait < 2700:
+                    time_left = (o.deadline - arr).total_seconds()
+
                     if sla_mode == "hard":
-                        # HARD SLA GUARD: If adding this order causes a late delivery, skip it entirely
                         if arr > o.deadline:
                             continue
-                        score = dist + (wait * 4)
+                        # Apply urgency weight to the next-order selection
+                        score = dist + (wait * 4) + (time_left * 0.5)
                     else:
-                        # DYNAMIC MODE: Mitigate via software cost penalty factors
-                        time_left = (o.deadline - arr).total_seconds()
                         sla_penalty = 100000 if time_left < 0 else 0
-                        score = dist + (wait * 4) + sla_penalty
+                        # Mitigate via software cost penalty factors + urgency
+                        score = dist + (wait * 4) + (max(0, time_left) * 0.5) + sla_penalty
 
                     if score < best_next_score:
                         best_next_score = score
@@ -147,24 +149,23 @@ def global_cvrp_solver(depot_coords, orders, num_vehicles, vehicle_capacity, spe
                 trip.append(best_next)
                 unassigned.remove(best_next)
                 dist = calculate_haversine_distance(current_loc, best_next.coords)
-                trip_clock = max(trip_clock + timedelta(seconds=dist/speed_mps), best_next.order_time) + timedelta(minutes=2)
+                trip_clock = max(trip_clock + timedelta(seconds=dist / speed_mps), best_next.order_time) + timedelta(
+                    minutes=2)
                 current_loc = best_next.coords
             else:
                 break
 
-        # 3. Optimize sequence and finalize trip
         optimized_trip = local_search_2opt_time_aware(depot_coords, trip, speed_mps)
         v_trips[v_id].append(optimized_trip)
 
-        # 4. Simulate trip physically to set the vehicle's ready time for its NEXT trip
         sim_clock = current_clock
         sim_loc = depot_coords
         for o in optimized_trip:
             d = calculate_haversine_distance(sim_loc, o.coords)
-            sim_clock = max(sim_clock + timedelta(seconds=d/speed_mps), o.order_time) + timedelta(minutes=2)
+            sim_clock = max(sim_clock + timedelta(seconds=d / speed_mps), o.order_time) + timedelta(minutes=2)
             sim_loc = o.coords
 
         d_return = calculate_haversine_distance(sim_loc, depot_coords)
-        v_clocks[v_id] = sim_clock + timedelta(seconds=d_return/speed_mps)
+        v_clocks[v_id] = sim_clock + timedelta(seconds=d_return / speed_mps)
 
     return v_trips

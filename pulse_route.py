@@ -131,7 +131,8 @@ class DeliverySimulation:
                     path_length += self.graph.get_edge_data(route[i - 1], route[i])[0]['length']
             return path_coords, path_length
         except nx.NetworkXNoPath:
-            return [start_coords, end_coords], routing_engine_cvrp.calculate_haversine_distance(start_coords, end_coords)
+            return [start_coords, end_coords], routing_engine_cvrp.calculate_haversine_distance(start_coords,
+                                                                                                end_coords)
 
     def _travel(self, vehicle, end_loc):
         path_points, dist_meters = self._get_road_route(vehicle["loc"], end_loc)
@@ -321,6 +322,27 @@ elif st.session_state.current_step == 1:
             )
             st.success(f"Generated {num_orders} orders successfully!")
 
+        # Display the generated demand points immediately on the map if they exist
+        if 'orders' in st.session_state:
+            st.markdown("### 📍 Generated Demand Visualization")
+            depot_loc, boundary, _ = st.session_state['city_data']
+
+            # Construct preview map
+            preview_map = folium.Map(location=depot_loc, zoom_start=12, tiles="cartodbpositron")
+            folium.GeoJson(boundary, style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05}).add_to(
+                preview_map)
+            folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home'), popup="Central Depot").add_to(
+                preview_map)
+
+            # Plot generated order demand locations as blue circles before simulation assignment
+            for o in st.session_state['orders']:
+                folium.CircleMarker(
+                    location=o.coords, radius=4, color="#3498db", fill=True, fill_opacity=0.7,
+                    popup=f"<b>Order:</b> {o.id}<br><b>Placed:</b> {o.order_time.strftime('%H:%M')}"
+                ).add_to(preview_map)
+
+            components.html(preview_map._repr_html_(), height=450)
+
 
 # --- STEP 3: FLEET & STRATEGY SELECTION ---
 elif st.session_state.current_step == 2:
@@ -359,7 +381,8 @@ elif st.session_state.current_step == 2:
             sla_constraint_type = st.radio(
                 "Global SLA Rule Enforcement:",
                 options=["hard", "dynamic"],
-                format_func=lambda x: "Strict Constraint (Forces 100% SLA)" if x == "hard" else "Dynamic Balancing (Prioritizes Mileage Reduction)",
+                format_func=lambda
+                    x: "Strict Constraint (Forces 100% SLA)" if x == "hard" else "Dynamic Balancing (Prioritizes Mileage Reduction)",
                 help="Hard Constraints enforce an absolute ban on deliveries that exceed their deadline. Dynamic allows marginal tardiness if it saves massive travel distance."
             )
 

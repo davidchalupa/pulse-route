@@ -11,6 +11,9 @@ import networkx as nx
 import pickle
 import streamlit as st
 import streamlit.components.v1 as components
+import numpy as np
+from scipy.sparse.csgraph import minimum_spanning_tree
+from math import radians, cos, sin, asin, sqrt
 
 # Import original and new routing engines
 import routing_engine_nn
@@ -116,6 +119,47 @@ class DeliverySimulation:
         self.vehicles = [{"id": i, "loc": depot_coords, "time": orders[0].order_time if orders else datetime.now(),
                           "trajectory": [], "distance": 0.0} for i in range(num_vehicles)]
 
+    def _haversine(self, coord1, coord2):
+        """Calculates the great-circle distance between two points in meters."""
+        lat1, lon1 = map(radians, coord1)
+        lat2, lon2 = map(radians, coord2)
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+        a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+        return 2 * asin(sqrt(a)) * 6371000
+
+    def _calculate_theoretical_lower_bound(self):
+        """Computes the 'Greedy Ideal' lower bound for routing distance."""
+        if not self.orders:
+            return 0.0
+
+        n = len(self.orders)
+        dist_matrix = np.zeros((n, n))
+        coords = [o.coords for o in self.orders]
+
+        # 1. Build Distance Matrix
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = self._haversine(coords[i], coords[j])
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+
+        # 2. Compute Minimum Spanning Tree (MST)
+        mst = minimum_spanning_tree(dist_matrix)
+        mst_distance = mst.sum()
+
+        # 3. Apply Network Circuity Factor (approx. 25% road overhead vs straight line)
+        circuity_factor = 1.25
+        network_mst_dist = mst_distance * circuity_factor
+
+        # 4. Return to Depot Penalty (Approximated max cycles required)
+        depot_distances = [self._haversine(self.depot, c) for c in coords]
+        max_depot_dist = max(depot_distances)
+        trips_required = n / self.vehicle_capacity
+        depot_penalty = max_depot_dist * 2 * trips_required
+
+        return network_mst_dist + depot_penalty
+
     def _get_road_route(self, start_coords, end_coords):
         orig_node = ox.nearest_nodes(self.graph, start_coords[1], start_coords[0])
         dest_node = ox.nearest_nodes(self.graph, end_coords[1], end_coords[0])
@@ -150,6 +194,7 @@ class DeliverySimulation:
 
     def run(self):
         on_time = 0
+        theoretical_min_distance = self._calculate_theoretical_lower_bound()
 
         # ==========================================================
         # STRATEGY A: GLOBAL CVRP OPTIMIZATION (Trip-Aware Deployment)
@@ -244,7 +289,13 @@ class DeliverySimulation:
                 self._travel(v, self.depot)
 
         total_distance = sum(v["distance"] for v in self.vehicles)
-        return {"orders": self.orders, "vehicles": self.vehicles, "on_time": on_time, "total_distance": total_distance}
+        return {
+            "orders": self.orders,
+            "vehicles": self.vehicles,
+            "on_time": on_time,
+            "total_distance": total_distance,
+            "theoretical_min_distance": theoretical_min_distance
+        }
 
 
 # --- 4. Stepper Logic & UI Pipeline ---
@@ -358,11 +409,30 @@ elif st.session_state.current_step == 2:
         spd = c2.slider("Speed (km/h)", 20, 80, 45)
 
         st.markdown("### 🎛️ Optimization Scope Selection")
-        opt_scope = st.radio(
+
+        opt_scope = st.selectbox(
             "Select System Optimization Strategy:",
-            ["Local (Fixed Sequential Batches)", "Global (Dynamic Fleet Assignment)"],
-            help="Local Strategy locks orders chronologically into fixed batches before sequencing. Global Strategy dissolves batch borders, assigning orders dynamically across the entire fleet to achieve minimized global travel penalties."
+            options=["Local (Fixed Sequential Batches)", "Global (Dynamic Fleet Assignment)"],
+            help="Choose how orders are clustered and dispatched to your fleet."
         )
+
+        # Dynamic Explainer Blocks based on selection
+        if opt_scope == "Local (Fixed Sequential Batches)":
+            st.info(
+                "⏳ **How it works:** Orders are locked into chronological batches based on order time. "
+                "Once a batch fills up or hits the Max Wait threshold, the system triggers local pathing "
+                "(Nearest Neighbor/2-Opt) for that single batch.\n\n"
+                "⚖️ **Trade-off:** Fast and predictable execution, but can result in **higher overall mileage** "
+                "if concurrent orders are scattered on opposite sides of the city."
+            )
+        else:
+            st.success(
+                "🌍 **How it works:** Solves a global Capacitated Vehicle Routing Problem (CVRP). "
+                "It treats the entire fleet and order pool as a holistic ecosystem, dynamically assignmenting "
+                "trips and sequencing stops to maximize spatial efficiency.\n\n"
+                "⚖️ **Trade-off:** Delivers **significantly lower total mileage** and optimized fleet utilization, "
+                "but requires a heavier computational footprint."
+            )
 
         chosen_algorithm = routing_engine_ls_2opt.base_route_sequencer
         engine_name_notice = "2-Opt Local Search Sequencer"
@@ -383,7 +453,7 @@ elif st.session_state.current_step == 2:
                 options=["hard", "dynamic"],
                 format_func=lambda
                     x: "Strict Constraint (Forces 100% SLA)" if x == "hard" else "Dynamic Balancing (Prioritizes Mileage Reduction)",
-                help="Hard Constraints enforce an absolute ban on deliveries that exceed their deadline. Dynamic allows marginal tardiness if it saves massive travel distance."
+                help="Hard Constraints completely reject paths that violate deadlines. Dynamic allows minor lateness if it yields massive fuel/distance savings."
             )
 
         st.session_state['sim_params'] = {
@@ -419,13 +489,21 @@ elif st.session_state.current_step == 3:
 
                 # --- Metrics Display ---
                 st.subheader("Simulation Performance Analysis")
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 success_rate = (results['on_time'] / len(orders)) * 100
                 c1.metric("SLA Success Rate", f"{success_rate:.1f}%",
                           f"{results['on_time']}/{len(orders)} On Time",
                           delta_color="normal" if success_rate > 90 else "inverse")
-                c2.metric("Total Distance Driven", f"{results['total_distance'] / 1000:.2f} km")
-                c3.metric("Active Fleet Strength", f"{params['num_vehicles']} Vehicles Used")
+                c2.metric("Actual Distance", f"{results['total_distance'] / 1000:.2f} km")
+
+                # Compare actual vs theoretical ideal
+                lower_bound_km = results['theoretical_min_distance'] / 1000
+                efficiency_gap = (results['total_distance'] / results['theoretical_min_distance']) if results[
+                                                                                                          'theoretical_min_distance'] > 0 else 1
+                c3.metric("Theoretical Min (Greedy Ideal)", f"{lower_bound_km:.2f} km",
+                          f"{efficiency_gap:.1f}x Multiplier", delta_color="off")
+
+                c4.metric("Active Fleet", f"{params['num_vehicles']} Vehicles Used")
 
                 # --- Leaflet Map Reconstruction Pipeline ---
                 m = folium.Map(location=depot_loc, zoom_start=13, tiles="cartodbpositron")

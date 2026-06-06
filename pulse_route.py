@@ -395,9 +395,9 @@ elif st.session_state.current_step == 1:
             components.html(preview_map._repr_html_(), height=450)
 
 
-# --- STEP 3: FLEET & STRATEGY SELECTION ---
+# --- STEP 3: FLEET CONFIGURATION ---
 elif st.session_state.current_step == 2:
-    st.header("Fleet & Optimization Strategy Configuration")
+    st.header("Fleet & Constraint Configuration")
     if 'orders' not in st.session_state:
         st.warning("Please generate demand first.")
     else:
@@ -408,6 +408,22 @@ elif st.session_state.current_step == 2:
                          help="How long a package waits at the depot to build a batch (Only applies to Local Strategy).")
         spd = c2.slider("Speed (km/h)", 20, 80, 45)
 
+        st.session_state['sim_params'] = {
+            "num_vehicles": num_v,
+            "vehicle_capacity": cap,
+            "max_wait_minutes": wait,
+            "vehicle_speed_kmh": spd
+        }
+        st.success("Fleet configurations recorded! Proceed to simulation screen to select optimization engine.")
+
+
+# --- STEP 4: SIMULATE ---
+elif st.session_state.current_step == 3:
+    st.header("Run Simulation & View Results")
+    if 'sim_params' not in st.session_state:
+        st.warning("Please configure fleet parameters first.")
+    else:
+        # --- Optimization Scope Selection (Moved to Simulation Page for On-Screen Alternating) ---
         st.markdown("### 🎛️ Optimization Scope Selection")
 
         opt_scope = st.selectbox(
@@ -439,7 +455,7 @@ elif st.session_state.current_step == 2:
         sla_constraint_type = "hard"
 
         if opt_scope == "Local (Fixed Sequential Batches)":
-            selected_engine_name = c1.selectbox(
+            selected_engine_name = st.selectbox(
                 "Local Routing Sequence Variant",
                 options=["Nearest Neighbor Heuristic (Fast Baseline)", "2-Opt Local Search (Path Untangling)"],
                 index=1
@@ -456,28 +472,24 @@ elif st.session_state.current_step == 2:
                 help="Hard Constraints completely reject paths that violate deadlines. Dynamic allows minor lateness if it yields massive fuel/distance savings."
             )
 
-        st.session_state['sim_params'] = {
-            "num_vehicles": num_v,
-            "vehicle_capacity": cap,
-            "max_wait_minutes": wait,
-            "vehicle_speed_kmh": spd,
-            "route_algorithm": chosen_algorithm,
-            "optimization_scope": opt_scope,
-            "sla_mode": sla_constraint_type
-        }
-        st.success(f"Configuration locked using strategy: {opt_scope}!")
+        # --- Collapsible Strategy Comparison Summary Table Placeholder ---
+        summary_placeholder = st.empty()
+        with summary_placeholder.container():
+            if 'sim_history' in st.session_state and st.session_state['sim_history']:
+                with st.expander("📊 Collapsible Strategy Performance Comparison Summary", expanded=True):
+                    st.table(st.session_state['sim_history'])
 
-
-# --- STEP 4: SIMULATE ---
-elif st.session_state.current_step == 3:
-    st.header("Run Simulation & View Results")
-    if 'sim_params' not in st.session_state:
-        st.warning("Please configure fleet parameters first.")
-    else:
         if st.button("🚀 Start Simulation", type="primary"):
             depot_loc, boundary, graph = st.session_state['city_data']
             orders = st.session_state['orders']
-            params = st.session_state['sim_params']
+
+            # Combine static fleet parameters with strategy selections made on-screen
+            params = st.session_state['sim_params'].copy()
+            params.update({
+                "route_algorithm": chosen_algorithm,
+                "optimization_scope": opt_scope,
+                "sla_mode": sla_constraint_type
+            })
 
             with st.spinner(f"Simulating routing via {params['optimization_scope']}..."):
                 for o in orders:
@@ -487,19 +499,44 @@ elif st.session_state.current_step == 3:
                 sim = DeliverySimulation(depot_loc, orders, graph, **params)
                 results = sim.run()
 
-                # --- Metrics Display ---
-                st.subheader("Simulation Performance Analysis")
-                c1, c2, c3, c4 = st.columns(4)
+                # Calculate run metrics
                 success_rate = (results['on_time'] / len(orders)) * 100
-                c1.metric("SLA Success Rate", f"{success_rate:.1f}%",
-                          f"{results['on_time']}/{len(orders)} On Time",
-                          delta_color="normal" if success_rate > 90 else "inverse")
-                c2.metric("Actual Distance", f"{results['total_distance'] / 1000:.2f} km")
-
-                # Compare actual vs theoretical ideal
+                actual_distance_km = results['total_distance'] / 1000
                 lower_bound_km = results['theoretical_min_distance'] / 1000
                 efficiency_gap = (results['total_distance'] / results['theoretical_min_distance']) if results[
                                                                                                           'theoretical_min_distance'] > 0 else 1
+
+                # Append metrics into summary logs matching specific names
+                if 'sim_history' not in st.session_state:
+                    st.session_state['sim_history'] = {}
+
+                history_key = f"{opt_scope}"
+                if opt_scope == "Local (Fixed Sequential Batches)":
+                    history_key += f" ({'NN' if 'Nearest Neighbor' in selected_engine_name else '2-Opt'})"
+                else:
+                    history_key += f" ({sla_constraint_type.capitalize()} SLA)"
+
+                st.session_state['sim_history'][history_key] = {
+                    "SLA Success": f"{success_rate:.1f}%",
+                    "Actual Route Dist": f"{actual_distance_km:.2f} km",
+                    "Ideal Bound": f"{lower_bound_km:.2f} km",
+                    "Overhead Factor": f"{efficiency_gap:.2f}x"
+                }
+
+                # Dynamically write updated statistics into the summary container block instantly on finish
+                with summary_placeholder.container():
+                    with st.expander("📊 Collapsible Strategy Performance Comparison Summary", expanded=True):
+                        st.table(st.session_state['sim_history'])
+
+                # --- Metrics Display ---
+                st.subheader("Simulation Performance Analysis")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("SLA Success Rate", f"{success_rate:.1f}%",
+                          f"{results['on_time']}/{len(orders)} On Time",
+                          delta_color="normal" if success_rate > 90 else "inverse")
+                c2.metric("Actual Distance", f"{actual_distance_km:.2f} km")
+
+                # Compare actual vs theoretical ideal
                 c3.metric("Theoretical Min (Greedy Ideal)", f"{lower_bound_km:.2f} km",
                           f"{efficiency_gap:.1f}x Multiplier", delta_color="off")
 

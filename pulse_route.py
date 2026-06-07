@@ -458,7 +458,7 @@ elif st.session_state.current_step == 3:
             selected_engine_name = st.selectbox(
                 "Local Routing Sequence Variant",
                 options=["Nearest Neighbor Heuristic (Fast Baseline)", "2-Opt Local Search (Path Untangling)"],
-                index=1
+                index=0
             )
             if "Nearest Neighbor" in selected_engine_name:
                 chosen_algorithm = routing_engine_nn.base_route_sequencer
@@ -472,11 +472,11 @@ elif st.session_state.current_step == 3:
                 help="Hard Constraints completely reject paths that violate deadlines. Dynamic allows minor lateness if it yields massive fuel/distance savings."
             )
 
-        # --- Collapsible Strategy Comparison Summary Table Placeholder ---
+        # --- Strategy Comparison Summary Table Placeholder ---
         summary_placeholder = st.empty()
         with summary_placeholder.container():
             if 'sim_history' in st.session_state and st.session_state['sim_history']:
-                with st.expander("📊 Collapsible Strategy Performance Comparison Summary", expanded=True):
+                with st.expander("📊 Strategy Performance Comparison Summary", expanded=True):
                     st.table(st.session_state['sim_history'])
 
         if st.button("🚀 Start Simulation", type="primary"):

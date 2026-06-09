@@ -14,6 +14,7 @@ import streamlit.components.v1 as components
 import numpy as np
 from scipy.sparse.csgraph import minimum_spanning_tree
 from math import radians, cos, sin, asin, sqrt
+from streamlit_folium import st_folium
 
 # Import original and new routing engines
 import routing_engine_nn
@@ -29,7 +30,7 @@ st.markdown("Model demand, configure fleets, and visualize dynamic routing.")
 # --- 1. Geospatial & Boundary Helpers ---
 @st.cache_resource(show_spinner=False)
 def get_city_data(city_name):
-    """Fetches city boundary, center, and road network with caching."""
+    """Fetches city boundary, default center, and road network with caching."""
     cache_dir = "city_cache"
     os.makedirs(cache_dir, exist_ok=True)
     safe_name = city_name.replace(",", "").replace(" ", "_").lower()
@@ -39,7 +40,7 @@ def get_city_data(city_name):
         with open(cache_path, 'rb') as f:
             return pickle.load(f)
 
-    headers = {'User-Agent': 'PulseRouteSimulation_v4_Streamlit'}
+    headers = {'User-Agent': 'PulseRouteSimulation_v5_Streamlit'}
     params = {'q': city_name, 'polygon_geojson': 1, 'format': 'json', 'limit': 1}
     url = "https://nominatim.openstreetmap.org/search"
 
@@ -51,7 +52,7 @@ def get_city_data(city_name):
     center_coords = (float(data['lat']), float(data['lon']))
     boundary_shape = shape(data['geojson'])
 
-    # Download graph
+    # Download graph for the exact city polygon
     graph = ox.graph_from_polygon(boundary_shape, network_type='drive')
 
     city_data = (center_coords, boundary_shape, graph)
@@ -315,25 +316,49 @@ for i, name in enumerate(step_names):
 
 st.divider()
 
-# --- STEP 1: LOCATION ---
+# --- STEP 1: LOCATION (REPLACED) ---
 if st.session_state.current_step == 0:
     st.header("Select Operating City")
+    st.markdown(
+        "Search for a city to load its exact boundaries. Once loaded, **click anywhere on the map** to place your central depot.")
+
     city_input = st.text_input("Enter City, Country", value="Bratislava, Slovakia")
 
     if st.button("Fetch Map Data"):
-        with st.spinner("Fetching data and mapping road network (this may take a minute on first run)..."):
+        with st.spinner("Fetching boundary and mapping road network (this may take a minute on first run)..."):
             try:
+                # Reset data when a new city is fetched
                 st.session_state['city_data'] = get_city_data(city_input)
-                st.success(f"Loaded {city_input} successfully!")
+                st.success(f"Loaded {city_input} successfully! You can now click the map to move the depot.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
     if 'city_data' in st.session_state:
-        depot_loc, boundary, _ = st.session_state['city_data']
+        depot_loc, boundary, graph = st.session_state['city_data']
+
+        # Build the map
         m = folium.Map(location=depot_loc, zoom_start=12)
         folium.GeoJson(boundary, style_function=lambda x: {'color': 'blue', 'fillOpacity': 0.1}).add_to(m)
-        folium.Marker(depot_loc, popup="Depot (Center)").add_to(m)
-        components.html(m._repr_html_(), height=400)
+        folium.Marker(depot_loc, popup="Depot (Click map to move)", icon=folium.Icon(color='red', icon='home')).add_to(
+            m)
+
+        # Render map and capture clicks using st_folium instead of components.html
+        map_data = st_folium(m, height=450, use_container_width=True, key="city_map")
+
+        # Handle Map Clicks dynamically
+        if map_data and map_data.get("last_clicked"):
+            lat = map_data["last_clicked"]["lat"]
+            lon = map_data["last_clicked"]["lng"]
+            clicked_point = Point(lon, lat)
+
+            # Validate the click is actually inside the city polygon
+            if boundary.contains(clicked_point):
+                if (lat, lon) != depot_loc:
+                    # Repack the tuple with the new depot location to maintain downstream compatibility
+                    st.session_state['city_data'] = ((lat, lon), boundary, graph)
+                    st.rerun()
+            else:
+                st.warning("⚠️ Please click inside the blue city boundary to place the depot.")
 
 
 # --- STEP 2: DEMAND ---

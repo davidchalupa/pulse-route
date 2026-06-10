@@ -28,18 +28,24 @@ st.markdown("Model demand, configure fleets, and visualize dynamic routing.")
 
 
 # --- 1. Geospatial & Boundary Helpers ---
+def get_cached_cities():
+    """Scans the cache directory and extracts human-readable city names."""
+    cache_dir = "city_cache"
+    if not os.path.exists(cache_dir):
+        return {}
+    cached = {}
+    for f in os.listdir(cache_dir):
+        if "__" in f and f.endswith(".pkl"):
+            parts = f.split("__", 1)
+            if len(parts) == 2:
+                display_name = parts[1].rsplit(".pkl", 1)[0].replace("-", "/").replace("_", " ")
+                cached[display_name] = f
+    return cached
+
+
 @st.cache_resource(show_spinner=False)
 def get_city_data(city_name):
     """Fetches city boundary, default center, and road network with caching."""
-    cache_dir = "city_cache"
-    os.makedirs(cache_dir, exist_ok=True)
-    safe_name = city_name.replace(",", "").replace(" ", "_").lower()
-    cache_path = os.path.join(cache_dir, f"{safe_name}.pkl")
-
-    if os.path.exists(cache_path):
-        with open(cache_path, 'rb') as f:
-            return pickle.load(f)
-
     headers = {'User-Agent': 'PulseRouteSimulation_v5_Streamlit'}
     params = {'q': city_name, 'polygon_geojson': 1, 'format': 'json', 'limit': 1}
     url = "https://nominatim.openstreetmap.org/search"
@@ -49,6 +55,32 @@ def get_city_data(city_name):
         raise ValueError(f"Could not find or fetch data for '{city_name}'.")
 
     data = response.json()[0]
+
+    # Reconcile duplicate caching by tracking the unique OpenStreetMap entity ID
+    osm_id = data.get('osm_id', 'unknown')
+    osm_type = data.get('osm_type', 'node')
+    unique_city_key = f"{osm_type}_{osm_id}"
+    canonical_name = data.get('display_name', city_name).replace("/", "-").replace("\\", "-").replace(" ", "_")
+
+    cache_dir = "city_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Locate matching file by prefix to prevent alternative naming schemas from duplicating data
+    target_file = None
+    for f in os.listdir(cache_dir):
+        if f.startswith(f"{unique_city_key}__") and f.endswith(".pkl"):
+            target_file = f
+            break
+
+    if target_file:
+        cache_path = os.path.join(cache_dir, target_file)
+    else:
+        cache_path = os.path.join(cache_dir, f"{unique_city_key}__{canonical_name}.pkl")
+
+    if os.path.exists(cache_path):
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+
     center_coords = (float(data['lat']), float(data['lon']))
     boundary_shape = shape(data['geojson'])
 
@@ -125,7 +157,7 @@ class DeliverySimulation:
         lat1, lon1 = map(radians, coord1)
         lat2, lon2 = map(radians, coord2)
         dlon = lon2 - lon1
-        dlat = lat2 - lat1
+        dlat = dlat = lat2 - lat1
         a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         return 2 * asin(sqrt(a)) * 6371000
 
@@ -201,7 +233,6 @@ class DeliverySimulation:
         # STRATEGY A: GLOBAL CVRP OPTIMIZATION (Trip-Aware Deployment)
         # ==========================================================
         if "Global" in self.optimization_scope:
-            # Let the CVRP engine figure out fleet assignment and sequence upfront using trips
             global_trips = routing_engine_cvrp.global_cvrp_solver(
                 self.depot, self.orders, len(self.vehicles), self.vehicle_capacity,
                 self.vehicle_speed_kmh, sla_mode=self.sla_mode
@@ -212,7 +243,6 @@ class DeliverySimulation:
                 if not assigned_trips:
                     continue
 
-                # Align vehicle starting clock safely to its first assigned trip
                 if v["time"] < assigned_trips[0][0].order_time:
                     v["time"] = assigned_trips[0][0].order_time
 
@@ -220,13 +250,10 @@ class DeliverySimulation:
                     if not trip:
                         continue
 
-                    # Log departure from depot
                     v["trajectory"].append((v["time"], v["loc"]))
-                    v["time"] += timedelta(minutes=5)  # Loading time at depot for this trip
+                    v["time"] += timedelta(minutes=5)
 
-                    # Deliver the optimized sequence within this discrete trip
                     for order in trip:
-                        # Safety fallback: vehicle clock cannot deliver an order before it is placed
                         if v["time"] < order.order_time:
                             v["time"] = order.order_time
                             v["trajectory"].append((v["time"], v["loc"]))
@@ -236,9 +263,8 @@ class DeliverySimulation:
                         order.assigned_vehicle = v["id"]
                         if order.delivered_at <= order.deadline:
                             on_time += 1
-                        v["time"] += timedelta(minutes=2)  # Dropoff time
+                        v["time"] += timedelta(minutes=2)
 
-                    # Return home to depot to conclude this trip and prepare for next capacity cycle
                     self._travel(v, self.depot)
 
         # ==========================================================
@@ -248,7 +274,6 @@ class DeliverySimulation:
             unassigned_orders = sorted(self.orders, key=lambda o: o.order_time)
 
             while unassigned_orders:
-                # Pick the earliest available vehicle
                 v = min(self.vehicles, key=lambda x: x["time"])
 
                 if v["time"] < unassigned_orders[0].order_time:
@@ -264,18 +289,16 @@ class DeliverySimulation:
                     elif len(batch) >= self.vehicle_capacity:
                         break
 
-                v["time"] = max(v["time"], batch[-1].order_time) + timedelta(minutes=5)  # Load time
+                v["time"] = max(v["time"], batch[-1].order_time) + timedelta(minutes=5)
 
                 for o in batch:
                     unassigned_orders.remove(o)
 
-                # Execute route sequence optimization via selected local strategy wrapper
                 try:
                     route_orders = self.route_algorithm(v["loc"], batch, route_id=f"Vehicle_{v['id']}_Batch")
                 except TypeError:
                     route_orders = self.route_algorithm(v["loc"], batch)
 
-                # Execute route travel simulation
                 for order in route_orders:
                     if v["time"] < order.order_time:
                         v["time"] = order.order_time
@@ -284,9 +307,8 @@ class DeliverySimulation:
                     order.assigned_vehicle = v["id"]
                     if order.delivered_at <= order.deadline:
                         on_time += 1
-                    v["time"] += timedelta(minutes=2)  # Dropoff time
+                    v["time"] += timedelta(minutes=2)
 
-                # Return to depot
                 self._travel(v, self.depot)
 
         total_distance = sum(v["distance"] for v in self.vehicles)
@@ -316,45 +338,112 @@ for i, name in enumerate(step_names):
 
 st.divider()
 
-# --- STEP 1: LOCATION (REPLACED) ---
+# --- STEP 1: LOCATION (UPDATED WITH NORMALIZED CONVENTION) ---
 if st.session_state.current_step == 0:
     st.header("Select Operating City")
     st.markdown(
         "Search for a city to load its exact boundaries. Once loaded, **click anywhere on the map** to place your central depot.")
 
-    city_input = st.text_input("Enter City, Country", value="Bratislava, Slovakia")
+    city_source = st.radio("Choose City Initialization Method:",
+                           ["🔍 Search Online (Nominatim API)", "💾 Load from Local Cache"], horizontal=True)
 
-    if st.button("Fetch Map Data"):
-        with st.spinner("Fetching boundary and mapping road network (this may take a minute on first run)..."):
-            try:
-                # Reset data when a new city is fetched
-                st.session_state['city_data'] = get_city_data(city_input)
-                st.success(f"Loaded {city_input} successfully! You can now click the map to move the depot.")
-            except Exception as e:
-                st.error(f"Error: {e}")
+    if city_source == "🔍 Search Online (Nominatim API)":
+        city_query = st.text_input("Type City Name (e.g., Prague, Paris, Bratislava)", value="Bratislava, Slovakia")
+
+        if st.button("Search for Matching Cities"):
+            if city_query:
+                with st.spinner("Searching for location suggestions..."):
+                    try:
+                        headers = {'User-Agent': 'PulseRouteSimulation_v5_Streamlit'}
+                        # Enforce addressdetails execution to extract clean keys
+                        params = {'q': city_query, 'format': 'json', 'limit': 10, 'addressdetails': 1}
+                        url = "https://nominatim.openstreetmap.org/search"
+                        res = requests.get(url, headers=headers, params=params)
+                        if res.status_code == 200 and res.json():
+                            suggestions = []
+                            for item in res.json():
+                                addr = item.get('address', {})
+                                # Fall back up through standard administrative layers if 'city' is missing
+                                city = addr.get('city') or addr.get('town') or addr.get('village') or addr.get(
+                                    'municipality')
+                                if not city:
+                                    city = item.get('display_name', '').split(',')[0].strip()
+
+                                state = addr.get('state')
+                                country = addr.get('country')
+
+                                if country:
+                                    # Formulate normalized 'City, State, Country' configuration for US entries
+                                    if country.lower() in ['united states', 'usa',
+                                                           'united states of america'] and state:
+                                        clean_name = f"{city}, {state}, {country}"
+                                    else:
+                                        clean_name = f"{city}, {country}"
+
+                                    if clean_name not in suggestions:
+                                        suggestions.append(clean_name)
+
+                            st.session_state['city_suggestions'] = suggestions
+                            st.session_state['search_performed'] = True
+                        else:
+                            st.warning("No suggestions found. Try adjusting your search query.")
+                            st.session_state['city_suggestions'] = []
+                            st.session_state['search_performed'] = False
+                    except Exception as e:
+                        st.error(f"Suggestion lookup failed: {e}")
+                        st.session_state['city_suggestions'] = []
+                        st.session_state['search_performed'] = False
+
+        search_performed = st.session_state.get('search_performed', False)
+        suggestions = st.session_state.get('city_suggestions', [])
+
+        city_input = st.selectbox(
+            "Confirm City Selection from Results List:",
+            options=suggestions if suggestions else ["Please trigger a successful city search first..."],
+            disabled=not search_performed
+        )
+
+        if st.button("Fetch Map Data", disabled=not search_performed):
+            with st.spinner("Fetching boundary and mapping road network (this may take a minute on first run)..."):
+                try:
+                    st.session_state['city_data'] = get_city_data(city_input)
+                    st.success(f"Loaded {city_input} successfully! You can now click the map to move the depot.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    else:
+        cached_dict = get_cached_cities()
+        if not cached_dict:
+            st.info("ℹ️ No cached cities found in your local directory yet. Try searching online first!")
+        else:
+            selected_cached = st.selectbox("Select from already cached cities:", options=list(cached_dict.keys()))
+            if st.button("Load Cached Map Data"):
+                with st.spinner("Loading cached network graph structure..."):
+                    try:
+                        cache_path = os.path.join("city_cache", cached_dict[selected_cached])
+                        with open(cache_path, 'rb') as f:
+                            st.session_state['city_data'] = pickle.load(f)
+                        st.success(f"Loaded {selected_cached} successfully from local cache!")
+                    except Exception as e:
+                        st.error(f"Error loading cached file: {e}")
 
     if 'city_data' in st.session_state:
         depot_loc, boundary, graph = st.session_state['city_data']
 
-        # Build the map
         m = folium.Map(location=depot_loc, zoom_start=12)
         folium.GeoJson(boundary, style_function=lambda x: {'color': 'blue', 'fillOpacity': 0.1}).add_to(m)
         folium.Marker(depot_loc, popup="Depot (Click map to move)", icon=folium.Icon(color='red', icon='home')).add_to(
             m)
 
-        # Render map and capture clicks using st_folium instead of components.html
         map_data = st_folium(m, height=450, use_container_width=True, key="city_map")
 
-        # Handle Map Clicks dynamically
         if map_data and map_data.get("last_clicked"):
             lat = map_data["last_clicked"]["lat"]
             lon = map_data["last_clicked"]["lng"]
             clicked_point = Point(lon, lat)
 
-            # Validate the click is actually inside the city polygon
             if boundary.contains(clicked_point):
                 if (lat, lon) != depot_loc:
-                    # Repack the tuple with the new depot location to maintain downstream compatibility
                     st.session_state['city_data'] = ((lat, lon), boundary, graph)
                     st.rerun()
             else:
@@ -398,19 +487,16 @@ elif st.session_state.current_step == 1:
             )
             st.success(f"Generated {num_orders} orders successfully!")
 
-        # Display the generated demand points immediately on the map if they exist
         if 'orders' in st.session_state:
             st.markdown("### 📍 Generated Demand Visualization")
             depot_loc, boundary, _ = st.session_state['city_data']
 
-            # Construct preview map
             preview_map = folium.Map(location=depot_loc, zoom_start=12, tiles="cartodbpositron")
             folium.GeoJson(boundary, style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05}).add_to(
                 preview_map)
             folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home'), popup="Central Depot").add_to(
                 preview_map)
 
-            # Plot generated order demand locations as blue circles before simulation assignment
             for o in st.session_state['orders']:
                 folium.CircleMarker(
                     location=o.coords, radius=4, color="#3498db", fill=True, fill_opacity=0.7,
@@ -448,7 +534,6 @@ elif st.session_state.current_step == 3:
     if 'sim_params' not in st.session_state:
         st.warning("Please configure fleet parameters first.")
     else:
-        # --- Optimization Scope Selection (Moved to Simulation Page for On-Screen Alternating) ---
         st.markdown("### 🎛️ Optimization Scope Selection")
 
         opt_scope = st.selectbox(
@@ -457,7 +542,6 @@ elif st.session_state.current_step == 3:
             help="Choose how orders are clustered and dispatched to your fleet."
         )
 
-        # Dynamic Explainer Blocks based on selection
         if opt_scope == "Local (Fixed Sequential Batches)":
             st.info(
                 "⏳ **How it works:** Orders are locked into chronological batches based on order time. "
@@ -497,7 +581,6 @@ elif st.session_state.current_step == 3:
                 help="Hard Constraints completely reject paths that violate deadlines. Dynamic allows minor lateness if it yields massive fuel/distance savings."
             )
 
-        # --- Strategy Comparison Summary Table Placeholder ---
         summary_placeholder = st.empty()
         with summary_placeholder.container():
             if 'sim_history' in st.session_state and st.session_state['sim_history']:
@@ -508,7 +591,6 @@ elif st.session_state.current_step == 3:
             depot_loc, boundary, graph = st.session_state['city_data']
             orders = st.session_state['orders']
 
-            # Combine static fleet parameters with strategy selections made on-screen
             params = st.session_state['sim_params'].copy()
             params.update({
                 "route_algorithm": chosen_algorithm,
@@ -520,18 +602,15 @@ elif st.session_state.current_step == 3:
                 for o in orders:
                     o.delivered_at = None
 
-                # Creates simulation and injects configuration params
                 sim = DeliverySimulation(depot_loc, orders, graph, **params)
                 results = sim.run()
 
-                # Calculate run metrics
                 success_rate = (results['on_time'] / len(orders)) * 100
                 actual_distance_km = results['total_distance'] / 1000
                 lower_bound_km = results['theoretical_min_distance'] / 1000
                 efficiency_gap = (results['total_distance'] / results['theoretical_min_distance']) if results[
                                                                                                           'theoretical_min_distance'] > 0 else 1
 
-                # Append metrics into summary logs matching specific names
                 if 'sim_history' not in st.session_state:
                     st.session_state['sim_history'] = {}
 
@@ -548,26 +627,20 @@ elif st.session_state.current_step == 3:
                     "Overhead Factor": f"{efficiency_gap:.2f}x"
                 }
 
-                # Dynamically write updated statistics into the summary container block instantly on finish
                 with summary_placeholder.container():
                     with st.expander("📊 Collapsible Strategy Performance Comparison Summary", expanded=True):
                         st.table(st.session_state['sim_history'])
 
-                # --- Metrics Display ---
                 st.subheader("Simulation Performance Analysis")
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("SLA Success Rate", f"{success_rate:.1f}%",
                           f"{results['on_time']}/{len(orders)} On Time",
                           delta_color="normal" if success_rate > 90 else "inverse")
                 c2.metric("Actual Distance", f"{actual_distance_km:.2f} km")
-
-                # Compare actual vs theoretical ideal
                 c3.metric("Theoretical Min (Greedy Ideal)", f"{lower_bound_km:.2f} km",
                           f"{efficiency_gap:.1f}x Multiplier", delta_color="off")
-
                 c4.metric("Active Fleet", f"{params['num_vehicles']} Vehicles Used")
 
-                # --- Leaflet Map Reconstruction Pipeline ---
                 m = folium.Map(location=depot_loc, zoom_start=13, tiles="cartodbpositron")
                 folium.GeoJson(boundary, style_function=lambda x: {'color': 'gray', 'fillOpacity': 0.05}).add_to(m)
                 folium.Marker(depot_loc, icon=folium.Icon(color='black', icon='home'), popup="Central Depot").add_to(m)
@@ -596,7 +669,6 @@ elif st.session_state.current_step == 3:
                                                          "radius": 7}}
                         })
 
-                # Plot order drops matching original custom formatting structure
                 for o in results["orders"]:
                     m_color = "green" if o.delivered_at and o.delivered_at <= o.deadline else "red"
                     deliv_time = o.delivered_at.strftime('%H:%M') if o.delivered_at else "Unfulfilled"

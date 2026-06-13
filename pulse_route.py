@@ -252,9 +252,14 @@ elif st.session_state.current_step == 1:
 
         if st.button("Generate Demand"):
             start_date = datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
-            _, boundary, _ = st.session_state['city_data']
+            _, boundary, graph = st.session_state['city_data']
             st.session_state['orders'] = DemandManager.generate_realistic_demand(
-                boundary, start_date, num_orders, weights, tightness
+                city_polygon=boundary,
+                graph=graph,
+                start_time=start_date,
+                num_orders=num_orders,
+                hourly_weights=weights,
+                tightness=tightness,
             )
             st.success(f"Generated {num_orders} orders successfully!")
 

@@ -236,6 +236,13 @@ elif st.session_state.current_step == 1:
             tightness = st.slider("Customer Spread", 0.01, 0.08, 0.03,
                                   help="Lower = tightly clustered around depot. Higher = spread across city.")
 
+            # --- NEW: Generation Strategy Selector ---
+            gen_method = st.selectbox(
+                "Generation Strategy",
+                ["Realistic (Filtered Network)", "Gaussian Snapped (All Nodes)", "Raw Gaussian (Polygon Only)"],
+                help="Switch between spatial distribution logic."
+            )
+
         with col2:
             if profile_type == "Single Peak (Noon)":
                 weights = {8: 1, 9: 2, 10: 3, 11: 5, 12: 15, 13: 8, 14: 4, 15: 2, 16: 1}
@@ -253,15 +260,25 @@ elif st.session_state.current_step == 1:
         if st.button("Generate Demand"):
             start_date = datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
             _, boundary, graph = st.session_state['city_data']
-            st.session_state['orders'] = DemandManager.generate_realistic_demand(
-                city_polygon=boundary,
-                graph=graph,
-                start_time=start_date,
-                num_orders=num_orders,
-                hourly_weights=weights,
-                tightness=tightness,
-            )
-            st.success(f"Generated {num_orders} orders successfully!")
+
+            # --- NEW: Conditional Logic for Demand Generation ---
+            if gen_method == "Realistic (Filtered Network)":
+                st.session_state['orders'] = DemandManager.generate_realistic_demand(
+                    city_polygon=boundary, graph=graph, start_time=start_date,
+                    num_orders=num_orders, hourly_weights=weights, tightness=tightness
+                )
+            elif gen_method == "Gaussian Snapped (All Nodes)":
+                st.session_state['orders'] = DemandManager.generate_gaussian_snapped_demand(
+                    city_polygon=boundary, graph=graph, start_time=start_date,
+                    num_orders=num_orders, hourly_weights=weights, tightness=tightness
+                )
+            elif gen_method == "Raw Gaussian (Polygon Only)":
+                st.session_state['orders'] = DemandManager.generate_gaussian_demand(
+                    city_polygon=boundary, start_time=start_date,
+                    num_orders=num_orders, hourly_weights=weights, tightness=tightness
+                )
+
+            st.success(f"Generated {num_orders} orders successfully using the {gen_method.split(' (')[0]} method!")
 
         if 'orders' in st.session_state:
             st.markdown("### 📍 Generated Demand Visualization")

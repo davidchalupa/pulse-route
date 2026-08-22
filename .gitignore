@@ -1,0 +1,9 @@
+cache/
+city_cache/
+
+.idea
+.venv
+
+__pycache__
+
+sim_result.html

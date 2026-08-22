@@ -9,7 +9,7 @@ import routing_engine_nn
 import routing_engine_ls_2opt
 import routing_engine_cvrp
 
-# Assuming your cache helper is accessible from the main Streamlit file or a utils module
+# Import city data helper from app or shared utils
 from pulse_route import get_city_data
 
 
@@ -59,13 +59,13 @@ def run_benchmark(city_name="Bratislava, Slovakia", num_orders=50, num_vehicles=
     }
 
     results_summary = {}
+    ideal_bound_km = 0.0
 
     # 4. Execute Benchmark Loop
     for name, params in strategies.items():
         print(f"\n🏃 Running Strategy: {name}...")
 
-        # CRITICAL: Reset order status and times before each simulation pass!
-        # Otherwise, orders remain marked as "delivered" from the previous engine.
+        # Reset order state between runs
         for o in orders:
             o.delivered_at = None
             o.assigned_vehicle = None
@@ -78,38 +78,41 @@ def run_benchmark(city_name="Bratislava, Slovakia", num_orders=50, num_vehicles=
             **params
         }
 
-        # Initialize and run the simulation
         sim = DeliverySimulation(depot_loc, orders, graph, **sim_params)
         res = sim.run()
 
-        # Calculate metrics matching the Streamlit output
         success_rate = (res['on_time'] / len(orders)) * 100
         dist_km = res['total_distance'] / 1000
-        lower_bound_km = res['theoretical_min_distance'] / 1000
 
-        efficiency_gap = (dist_km / lower_bound_km) if lower_bound_km > 0 else 1
+        # Captured once since orders and depot location remain constant
+        ideal_bound_km = res['theoretical_min_distance'] / 1000
+        efficiency_gap = (dist_km / ideal_bound_km) if ideal_bound_km > 0 else 1.0
 
         results_summary[name] = {
             "SLA Success": f"{success_rate:.1f}%",
             "Actual Dist": f"{dist_km:.2f} km",
-            "Ideal Bound": f"{lower_bound_km:.2f} km",
             "Overhead Factor": f"{efficiency_gap:.2f}x"
         }
 
-    # 5. Output Tabular Summary
+    # 5. Output Tabular Summary with Single Ideal Bound Header
     print("\n" + "=" * 80)
     print("📊 BENCHMARK COMPARISON SUMMARY")
+    print(f"🎯 Theoretical Lower Bound (Greedy Ideal): {ideal_bound_km:.2f} km")
     print("=" * 80)
     header = f"{'Strategy Name':<28} | {'SLA Success':<12} | {'Actual Dist':<13} | {'Overhead'}"
     print(header)
     print("-" * 80)
 
     for strat, metrics in results_summary.items():
-        row = f"{strat:<28} | {metrics['SLA Success']:<12} | {metrics['Actual Dist']:<13} | {metrics['Overhead Factor']}"
+        row = (
+            f"{strat:<28} | "
+            f"{metrics['SLA Success']:<12} | "
+            f"{metrics['Actual Dist']:<13} | "
+            f"{metrics['Overhead Factor']}"
+        )
         print(row)
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    # You can easily wrap this in a loop to run multiple seeds/order volumes
     run_benchmark(num_orders=50, num_vehicles=2)

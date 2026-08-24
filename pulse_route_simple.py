@@ -1,16 +1,11 @@
-import os
-import webbrowser
 from datetime import datetime
 
-# Shared backend imports
 from demand_manager import DemandManager
 from delivery_simulation import DeliverySimulation
 import routing_engine_nn
 import routing_engine_ls_2opt
-import routing_engine_cvrp
 
-# Import city data helper from app or shared utils
-from pulse_route import get_city_data
+from city_data import get_city_data
 
 
 def run_benchmark(city_name="Bratislava, Slovakia", num_orders=50, num_vehicles=2):
